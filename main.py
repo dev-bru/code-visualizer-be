@@ -12,7 +12,11 @@ app = FastAPI()
 
 app.add_middleware(
     CORSMiddleware,
-    allow_origins=["http://localhost:3000", "http://localhost:8000", "https://yourdomain.com"],
+    allow_origins=[
+        "http://localhost:3000",
+        "http://localhost:8000",
+        "https://yourdomain.com",
+    ],
     allow_credentials=True,
     allow_methods=["*"],
     allow_headers=["*"],
@@ -33,8 +37,13 @@ class TraceResponse(BaseModel):
 
 
 class ComplexityRequest(BaseModel):
-    code: str = Field(..., description="Python code to analyze", min_length=1, max_length=100000)
-    language: str = Field(default="python", description="Programming language (currently only python supported)")
+    code: str = Field(
+        ..., description="Python code to analyze", min_length=1, max_length=100000
+    )
+    language: str = Field(
+        default="python",
+        description="Programming language (currently only python supported)",
+    )
 
 
 class ComplexityResponse(BaseModel):
@@ -66,6 +75,13 @@ async def trace_python(code: str, timeout: int):
 import sys
 import json
 import inspect
+import ast
+
+# Use a safe literal for the user code
+SOURCE = {json.dumps(code)}
+_ast_tree = ast.parse(SOURCE)
+_line_to_ast_info = {{}}
+_source_lines = SOURCE.splitlines()
 
 trace = []
 stdout_capture = []
@@ -76,15 +92,105 @@ call_stack = []  # Stack of (frame, frame_id) tuples
 frame_id_counter = [0]
 
 _INTERNAL_NAMES = {{
-    "sys", "json", "inspect",
+    "sys", "json", "inspect", "ast",
+    "SOURCE", "_ast_tree", "_source_lines",
     "trace", "stdout_capture",
     "heap", "heap_counter", "obj_to_heap_id",
     "call_stack", "frame_id_counter",
+    "_line_to_ast_info",
+    "_build_ast_explanations",
+    "_funcname_to_defline", "_classname_to_defline",
+    "_already_explained_defs",
+    "_attach_ast_eval",
     "_INTERNAL_NAMES", "_encode_object", "_clean_dict",
     "_build_stack_to_render", "trace_line",
     "CaptureStdout", "original_stdout", "_get_heap_id"
 }}
 
+def _build_ast_explanations():
+    for _node in ast.walk(_ast_tree):
+        _lineno = getattr(_node, "lineno", None)
+        if _lineno is None:
+            continue
+
+        if _lineno - 1 < 0 or _lineno - 1 >= len(_source_lines):
+            continue
+
+        line_text = _source_lines[_lineno - 1].rstrip("\\n")
+
+        # Class definition
+        if isinstance(_node, ast.ClassDef):
+            _line_to_ast_info[_lineno] = {{
+                "actual_statement": line_text,
+                "explanation": [
+                    {{"type": "class_definition", "data": {{"name": _node.name}}}}
+                ],
+            }}
+
+        # Function definition (top-level or method)
+        elif isinstance(_node, ast.FunctionDef):
+            _line_to_ast_info[_lineno] = {{
+                "actual_statement": line_text,
+                "explanation": [
+                    {{
+                        "type": "function_definition",
+                        "data": {{"name": _node.name, "args": [a.arg for a in _node.args.args]}},
+                    }}
+                ],
+            }}
+
+        # Simple assignment: x = ...
+        elif isinstance(_node, ast.Assign) and isinstance(_node.targets[0], ast.Name):
+            target = _node.targets[0].id
+            _line_to_ast_info[_lineno] = {{
+                "actual_statement": line_text,
+                "explanation": [
+                    {{
+                        "type": "variable_assignment",
+                        "data": {{"variable": target}},
+                    }}
+                ],
+            }}
+
+        # Attribute assignment: self.data = ...
+        elif isinstance(_node, ast.Assign) and isinstance(_node.targets[0], ast.Attribute):
+            attr = _node.targets[0].attr
+            obj = _node.targets[0].value.id if isinstance(_node.targets[0].value, ast.Name) else None
+            _line_to_ast_info[_lineno] = {{
+                "actual_statement": line_text,
+                "explanation": [
+                    {{
+                        "type": "attribute_assignment",
+                        "data": {{"object": obj, "attribute": attr}},
+                    }}
+                ],
+            }}
+
+        # Function call expression: foo(...), print(...)
+        elif isinstance(_node, ast.Call) and hasattr(_node.func, "id"):
+            fname = _node.func.id
+            _line_to_ast_info.setdefault(_lineno, {{
+                "actual_statement": line_text,
+                "explanation": [
+                    {{"type": "function_call", "data": {{"name": fname}}}}
+                ],
+            }})
+
+_build_ast_explanations()
+
+# Definition-line maps for functions and classes
+_funcname_to_defline = {{}}
+_classname_to_defline = {{}}
+_already_explained_defs = set()
+
+for _node in ast.walk(_ast_tree):
+    _lineno = getattr(_node, "lineno", None)
+    if _lineno is None:
+        continue
+    if isinstance(_node, ast.FunctionDef):
+        _funcname_to_defline[_node.name] = _lineno
+    elif isinstance(_node, ast.ClassDef):
+        _classname_to_defline[_node.name] = _lineno
 
 def _get_heap_id(obj):
     """Return a stable heap id for an object."""
@@ -95,7 +201,6 @@ def _get_heap_id(obj):
     heap_counter[0] += 1
     obj_to_heap_id[oid] = hid
     return hid
-
 
 def _encode_object(obj, visited=None):
     """
@@ -145,10 +250,8 @@ def _encode_object(obj, visited=None):
                     mid = _get_heap_id(val)
                     mkey = str(mid)
                     if mkey not in heap:
-                        # ensure method function encoded
                         _encode_object(val, visited)
                     methods.append([name, ["REF", mid]])
-            # bases as empty list for now (to match your sample)
             heap[key] = ["CLASS", obj.__name__, []] + methods
         return ["REF", hid]
 
@@ -167,20 +270,19 @@ def _encode_object(obj, visited=None):
     if isinstance(obj, list):
         hid = _get_heap_id(obj)
         key = str(hid)
-        if key not in heap:
-            encoded_list = [_encode_object(item, visited) for item in obj[:100]]
-            heap[key] = ["LIST", encoded_list]
+        # ALWAYS refresh the snapshot so mutations show up
+        encoded_list = [_encode_object(item, visited) for item in obj[:100]]
+        heap[key] = ["LIST", encoded_list]
         return ["REF", hid]
 
     # Dicts
     if isinstance(obj, dict):
         hid = _get_heap_id(obj)
         key = str(hid)
-        if key not in heap:
-            encoded_dict = {{}}
-            for k, v in list(obj.items())[:100]:
-                encoded_dict[k] = _encode_object(v, visited)
-            heap[key] = ["DICT", encoded_dict]
+        encoded_dict = {{}}
+        for k, v in list(obj.items())[:100]:
+            encoded_dict[k] = _encode_object(v, visited)
+        heap[key] = ["DICT", encoded_dict]
         return ["REF", hid]
 
     # Fallback: repr string
@@ -189,7 +291,6 @@ def _encode_object(obj, visited=None):
     except Exception:
         return "<unrepresentable>"
 
-
 def _clean_dict(d):
     """Filter dict and encode objects, skipping internal names and modules."""
     clean = {{}}
@@ -197,7 +298,6 @@ def _clean_dict(d):
         for k, v in d.items():
             if k in _INTERNAL_NAMES or k.startswith("_"):
                 continue
-            # Skip modules
             if str(type(v)).startswith("<class 'module"):
                 continue
             try:
@@ -208,15 +308,14 @@ def _clean_dict(d):
         pass
     return clean
 
-
 def _build_stack_to_render(current_frame):
     """Build stack_to_render in Python Tutor format."""
     stack_frames = []
-
     for frame, fid in call_stack:
+        if frame.f_code.co_name == "<module>":
+            continue
         is_highlighted = (frame == current_frame)
         locals_dict = _clean_dict(frame.f_locals)
-
         stack_frames.append({{
             "func_name": frame.f_code.co_name,
             "is_parent": False,
@@ -228,9 +327,20 @@ def _build_stack_to_render(current_frame):
             "is_highlighted": is_highlighted,
             "unique_hash": f"{{frame.f_code.co_name}}_f{{fid}}"
         }})
-
     return stack_frames
 
+def _attach_ast_eval(step, lineno):
+    info = _line_to_ast_info.get(lineno)
+    step["ast_eval"] = {{
+        "current_step": None,
+        "actual_statement": info["actual_statement"] if info else None,
+        "output": None,
+        "explanation": info["explanation"] if info else [],
+        "start_line": lineno,
+        "end_line": None,
+        "skip_line": False,
+    }}
+    step["dsa_steps"] = None
 
 def trace_line(frame, event, arg):
     global heap, call_stack
@@ -239,13 +349,30 @@ def trace_line(frame, event, arg):
     if "<string>" not in filename:
         return trace_line
 
+    func_name = frame.f_code.co_name
+
+    # Hide class body frames (class Task: body)
+    if event in ("call", "line", "return") and func_name in _classname_to_defline:
+        return trace_line
+        
+    if func_name in ("write", "flush"):
+        return trace_line
+
     if event == "call":
-        func_name = frame.f_code.co_name
-        if func_name not in ("write", "flush"):
+        if func_name not in ("write", "flush", "<module>"):
             frame_id_counter[0] += 1
             call_stack.append((frame, frame_id_counter[0]))
 
         globals_dict = _clean_dict(frame.f_globals)
+        # force-encode globals so heap gets CLASS/FUNCTION entries
+        for name, value in frame.f_globals.items():
+            if name in _INTERNAL_NAMES or name.startswith("_"):
+                continue
+            try:
+                _encode_object(value)
+            except Exception:
+                pass
+
         stack_to_render = _build_stack_to_render(frame)
 
         step = {{
@@ -258,13 +385,21 @@ def trace_line(frame, event, arg):
             "heap": dict(heap),
             "stdout": "".join(stdout_capture)
         }}
+        _attach_ast_eval(step, frame.f_lineno)
         trace.append(step)
 
     elif event == "return":
         globals_dict = _clean_dict(frame.f_globals)
+        for name, value in frame.f_globals.items():
+            if name in _INTERNAL_NAMES or name.startswith("_"):
+                continue
+            try:
+                _encode_object(value)
+            except Exception:
+                pass
+
         stack_to_render = _build_stack_to_render(frame)
 
-        # Add return value to locals
         for sf in stack_to_render:
             if sf["func_name"] == frame.f_code.co_name and sf["is_highlighted"]:
                 sf["encoded_locals"]["__return__"] = _encode_object(arg)
@@ -280,18 +415,37 @@ def trace_line(frame, event, arg):
             "heap": dict(heap),
             "stdout": "".join(stdout_capture)
         }}
+        _attach_ast_eval(step, frame.f_lineno)
         trace.append(step)
 
-        # Pop from call stack
         if call_stack and call_stack[-1][0] == frame:
             call_stack.pop()
 
     elif event == "line":
-        func_name = frame.f_code.co_name
         if func_name == "write":
             return trace_line
 
         globals_dict = _clean_dict(frame.f_globals)
+        for name, value in frame.f_globals.items():
+            if name in _INTERNAL_NAMES or name.startswith("_"):
+                continue
+            try:
+                _encode_object(value)
+            except Exception:
+                pass
+
+        def_line_to_use = None
+        if frame.f_code.co_name == "<module>":
+            for name in globals_dict.keys():
+                if name in _funcname_to_defline and name not in _already_explained_defs:
+                    def_line_to_use = _funcname_to_defline[name]
+                    _already_explained_defs.add(name)
+                    break
+                if name in _classname_to_defline and name not in _already_explained_defs:
+                    def_line_to_use = _classname_to_defline[name]
+                    _already_explained_defs.add(name)
+                    break
+
         stack_to_render = _build_stack_to_render(frame)
 
         step = {{
@@ -304,10 +458,13 @@ def trace_line(frame, event, arg):
             "heap": dict(heap),
             "stdout": "".join(stdout_capture)
         }}
+        if def_line_to_use is not None:
+            _attach_ast_eval(step, def_line_to_use)
+        else:
+            _attach_ast_eval(step, frame.f_lineno)
         trace.append(step)
 
     return trace_line
-
 
 class CaptureStdout:
     def write(self, text):
@@ -317,19 +474,16 @@ class CaptureStdout:
     def flush(self):
         pass
 
-
 original_stdout = sys.stdout
 
 try:
     sys.stdout = CaptureStdout()
     sys.settrace(trace_line)
 
-    # Reset frame id counter
     frame_id_counter[0] = 0
 
-    exec("""
-{code}
-""")
+    # Execute the same SOURCE we parsed
+    exec(SOURCE, globals(), globals())
 
 except Exception as e:
     trace.append({{
@@ -347,7 +501,6 @@ finally:
 result = {{"trace": trace, "metadata": {{"totalSteps": len(trace)}}}}
 print(json.dumps(result))
 '''
-
     try:
         result = subprocess.run(
             [sys.executable, "-c", tracer_code],
@@ -417,7 +570,7 @@ async def get_languages():
 async def analyze_complexity(req: ComplexityRequest):
     """
     Analyze code complexity and return detailed metrics with visualization data.
-    
+
     Handles edge cases:
     - Empty or whitespace-only code
     - Syntax errors
@@ -426,83 +579,91 @@ async def analyze_complexity(req: ComplexityRequest):
     - Invalid characters
     """
     warnings = []
-    
+
     try:
         # Edge case: Validate language
         if req.language.lower() != "python":
             return ComplexityResponse(
                 success=False,
                 error=f"Unsupported language: {req.language}. Currently only Python is supported.",
-                warnings=warnings
+                warnings=warnings,
             )
-        
+
         # Edge case: Empty or whitespace-only code
         if not req.code or not req.code.strip():
             return ComplexityResponse(
                 success=False,
                 error="Code cannot be empty or contain only whitespace",
-                warnings=warnings
+                warnings=warnings,
             )
-        
+
         # Edge case: Code too large (performance protection)
         if len(req.code) > 100000:
             warnings.append("Code is very large, analysis may take longer")
-        
+
         # Edge case: Check for common issues
-        if req.code.count('\n') < 1:
+        if req.code.count("\n") < 1:
             warnings.append("Code appears to be a single line, results may be limited")
-        
+
         # Perform complexity analysis
         analysis_result = analyze_code_complexity(req.code)
-        
+
         # Edge case: Check if analysis returned an error
         if "error" in analysis_result and analysis_result["error"]:
             return ComplexityResponse(
                 success=False,
                 complexity_data=analysis_result,
                 error=analysis_result["error"],
-                warnings=warnings
+                warnings=warnings,
             )
-        
+
         # Generate visualization data based on detected complexity
         visualization_data = _generate_visualization_data(analysis_result)
-        
+
         # Add helpful warnings based on analysis
         if analysis_result.get("timeComplexity", {}).get("notation") == "O(2^(2^n))":
-            warnings.append("⚠️ CRITICAL: Double exponential complexity detected - code may be extremely slow")
+            warnings.append(
+                "⚠️ CRITICAL: Double exponential complexity detected - code may be extremely slow"
+            )
         elif "2^n" in analysis_result.get("timeComplexity", {}).get("notation", ""):
-            warnings.append("⚠️ WARNING: Exponential complexity detected - consider optimization")
+            warnings.append(
+                "⚠️ WARNING: Exponential complexity detected - consider optimization"
+            )
         elif "n³" in analysis_result.get("timeComplexity", {}).get("notation", ""):
-            warnings.append("⚠️ WARNING: Cubic complexity detected - may be slow for large inputs")
-        
+            warnings.append(
+                "⚠️ WARNING: Cubic complexity detected - may be slow for large inputs"
+            )
+
         # Check for low confidence
         if analysis_result.get("timeComplexity", {}).get("confidence") == "low":
-            warnings.append("Complexity analysis has low confidence - manual review recommended")
-        
+            warnings.append(
+                "Complexity analysis has low confidence - manual review recommended"
+            )
+
         return ComplexityResponse(
             success=True,
             complexity_data=analysis_result,
             visualization_data=visualization_data,
-            warnings=warnings
+            warnings=warnings,
         )
-    
+
     except RecursionError:
         return ComplexityResponse(
             success=False,
             error="Code analysis exceeded recursion limit - code may be too complex or deeply nested",
-            warnings=warnings
+            warnings=warnings,
         )
     except MemoryError:
         return ComplexityResponse(
             success=False,
             error="Code analysis exhausted available memory - code file may be too large",
-            warnings=warnings
+            warnings=warnings,
         )
     except Exception as e:
         return ComplexityResponse(
             success=False,
             error=f"Unexpected error during analysis: {type(e).__name__}: {str(e)[:200]}",
-            warnings=warnings
+            warnings=warnings,
         )
 
 
@@ -512,33 +673,33 @@ def _generate_visualization_data(analysis_result: dict) -> dict:
     Creates sample data points showing growth rate for detected complexity.
     """
     time_complexity = analysis_result.get("timeComplexity", {}).get("notation", "O(1)")
-    
+
     # Generate sample input sizes
     n_values = [1, 10, 20, 30, 40, 50]
-    
+
     # Map complexity notations to growth functions
     complexity_map = {
         "O(1)": lambda n: 1,
-        "O(log n)": lambda n: max(1, int(n ** 0.5)),  # approximation
+        "O(log n)": lambda n: max(1, int(n**0.5)),  # approximation
         "O(n)": lambda n: n,
-        "O(n log n)": lambda n: int(n * (n ** 0.5)),  # approximation
-        "O(n²)": lambda n: n ** 2,
-        "O(n³)": lambda n: n ** 3,
+        "O(n log n)": lambda n: int(n * (n**0.5)),  # approximation
+        "O(n²)": lambda n: n**2,
+        "O(n³)": lambda n: n**3,
         "O(2^n)": lambda n: min(2 ** min(n, 20), 1000000),  # cap exponential
         "O(n!)": lambda n: min(_factorial_approx(n), 1000000),
         "O(2^(2^n))": lambda n: min(2 ** min(2 ** min(n, 4), 20), 1000000),
     }
-    
+
     # Find the best matching complexity
     detected_func = complexity_map.get("O(n)")  # default
     for key in complexity_map:
         if key in time_complexity:
             detected_func = complexity_map[key]
             break
-    
+
     # Generate data points
     data_points = [detected_func(n) for n in n_values]
-    
+
     # Also include common complexities for comparison
     comparison_data = {
         "O(1)": [complexity_map["O(1)"](n) for n in n_values],
@@ -547,13 +708,15 @@ def _generate_visualization_data(analysis_result: dict) -> dict:
         "O(n log n)": [complexity_map["O(n log n)"](n) for n in n_values],
         "O(n²)": [complexity_map["O(n²)"](n) for n in n_values],
     }
-    
+
     return {
         "detected_complexity": time_complexity,
         "data_points": data_points,
         "input_sizes": n_values,
         "comparison_data": comparison_data,
-        "space_complexity": analysis_result.get("spaceComplexity", {}).get("notation", "O(1)")
+        "space_complexity": analysis_result.get("spaceComplexity", {}).get(
+            "notation", "O(1)"
+        ),
     }
 
 
@@ -580,7 +743,6 @@ async def get_complexity_data():
         "O(n^2)": [1, 4, 9, 16, 25],
     }
     return sample_data
-
 
 
 @app.post("/visualize/validate")
